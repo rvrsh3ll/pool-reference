@@ -1,15 +1,15 @@
 from dataclasses import dataclass
 
-from blspy import G1Element
 from chia.pools.pool_wallet_info import PoolState
 from chia.types.blockchain_format.sized_bytes import bytes32
 from chia.types.coin_spend import CoinSpend
 from chia.util.ints import uint64
-from chia.util.streamable import streamable, Streamable
+from chia.util.streamable import Streamable, streamable
+from chia_rs import G1Element
 
 
-@dataclass(frozen=True)
 @streamable
+@dataclass(frozen=True)
 class FarmerRecord(Streamable):
     launcher_id: bytes32  # This uniquely identifies the singleton on the blockchain (ID for this farmer)
     p2_singleton_puzzle_hash: bytes32  # Derived from the launcher id, delay_time and delay_puzzle_hash

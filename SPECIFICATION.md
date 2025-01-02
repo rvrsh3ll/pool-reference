@@ -118,7 +118,7 @@ scripts and JS injections. It returns a JSON response with the following data:
 ```json
 {
     "description": "(example) The Reference Pool allows you to pool with low fees, paying out daily using Chia.",
-    "fee": 0.01,
+    "fee": "0.01",
     "logo_url": "https://www.chia.net/img/chia_logo.svg",
     "minimum_difficulty": 10,
     "name": "The Reference Pool",
@@ -170,7 +170,7 @@ Request parameter:
 
 Example request:
 ```
-https://poolurl.com/farmer/launcher_id=:launcher_id&authentication_token=:token&signature=:signature
+https://poolurl.com/farmer?launcher_id=:launcher_id&authentication_token=:token&signature=:signature
 ```
 
 Successful response:

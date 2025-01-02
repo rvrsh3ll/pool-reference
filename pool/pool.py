@@ -1,54 +1,58 @@
 import asyncio
+import dataclasses
 import logging
 import pathlib
 import time
 import traceback
 from asyncio import Task
 from math import floor
-from typing import Dict, Optional, Set, List, Tuple, Callable
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
-from blspy import AugSchemeMPL, G1Element
 from chia.consensus.block_rewards import calculate_pool_reward
-from chia.pools.pool_wallet_info import PoolState, PoolSingletonState
-from chia.protocols.pool_protocol import (
-    PoolErrorCode,
-    PostPartialRequest,
-    PostPartialResponse,
-    PostFarmerRequest,
-    PostFarmerResponse,
-    PutFarmerRequest,
-    PutFarmerResponse,
-    POOL_PROTOCOL_VERSION,
-)
-from chia.rpc.wallet_rpc_client import WalletRpcClient
-from chia.types.blockchain_format.coin import Coin
-from chia.types.coin_record import CoinRecord
-from chia.types.coin_spend import CoinSpend
-from chia.util.bech32m import decode_puzzle_hash
 from chia.consensus.constants import ConsensusConstants
-from chia.util.ints import uint8, uint16, uint32, uint64
-from chia.util.byte_types import hexstr_to_bytes
-from chia.util.default_root import DEFAULT_ROOT_PATH
-from chia.rpc.full_node_rpc_client import FullNodeRpcClient
-from chia.full_node.signage_point import SignagePoint
-from chia.types.end_of_slot_bundle import EndOfSubSlotBundle
-from chia.types.blockchain_format.sized_bytes import bytes32
+from chia.consensus.default_constants import DEFAULT_CONSTANTS
 from chia.consensus.pot_iterations import calculate_iterations_quality
-from chia.util.lru_cache import LRUCache
-from chia.util.chia_logging import initialize_logging
-from chia.wallet.transaction_record import TransactionRecord
+from chia.full_node.signage_point import SignagePoint
 from chia.pools.pool_puzzles import (
-    get_most_recent_singleton_coin_from_coin_spend,
     get_delayed_puz_info_from_launcher_spend,
+    get_most_recent_singleton_coin_from_coin_spend,
     launcher_id_to_p2_puzzle_hash,
 )
+from chia.pools.pool_wallet_info import PoolSingletonState, PoolState
+from chia.protocols.pool_protocol import (
+    POOL_PROTOCOL_VERSION,
+    PoolErrorCode,
+    PostFarmerRequest,
+    PostFarmerResponse,
+    PostPartialRequest,
+    PostPartialResponse,
+    PutFarmerRequest,
+)
+from chia.rpc.full_node_rpc_client import FullNodeRpcClient
+from chia.rpc.wallet_request_types import SendTransactionMultiResponse
+from chia.rpc.wallet_rpc_client import WalletRpcClient
+from chia.types.blockchain_format.coin import Coin
+from chia.types.blockchain_format.proof_of_space import verify_and_get_quality_string
+from chia.types.blockchain_format.sized_bytes import bytes32
+from chia.types.coin_record import CoinRecord
+from chia.types.coin_spend import CoinSpend
+from chia.types.end_of_slot_bundle import EndOfSubSlotBundle
+from chia.util.bech32m import decode_puzzle_hash
+from chia.util.byte_types import hexstr_to_bytes
+from chia.util.chia_logging import initialize_logging
+from chia.util.default_root import DEFAULT_ROOT_PATH
+from chia.util.ints import uint8, uint16, uint32, uint64
+from chia.util.lru_cache import LRUCache
+from chia.wallet.transaction_record import TransactionRecord
+from chia.wallet.util.tx_config import TXConfig
+from chia_rs import AugSchemeMPL, G1Element
 
 from .difficulty_adjustment import get_new_difficulty
-from .singleton import create_absorb_transaction, get_singleton_state, get_coin_spend, get_farmed_height
+from .record import FarmerRecord
+from .singleton import create_absorb_transaction, get_coin_spend, get_singleton_state
 from .store.abstract import AbstractPoolStore
 from .store.sqlite_store import SqlitePoolStore
-from .record import FarmerRecord
-from .util import error_dict, RequestMetadata
+from .util import RequestMetadata, error_dict
 
 
 class Pool:
@@ -76,12 +80,14 @@ class Pool:
 
         self.config = config
         self.constants = constants
+        self.store: AbstractPoolStore
 
-        if pool_config.get('store') == "MariadbPoolStore":
+        if pool_config.get("store") == "MariadbPoolStore":
             from .store.mariadb_store import MariadbPoolStore
-            self.store: AbstractPoolStore = pool_store or MariadbPoolStore()
+
+            self.store = pool_store or MariadbPoolStore()
         else:
-            self.store: AbstractPoolStore = pool_store or SqlitePoolStore()
+            self.store = pool_store or SqlitePoolStore()
 
         self.pool_fee = pool_config["pool_fee"]
 
@@ -157,10 +163,13 @@ class Pool:
         self.pending_payments: Optional[asyncio.Queue] = None
 
         # Keeps track of the latest state of our node
-        self.blockchain_state = {"peak": None}
+        self.blockchain_state: Dict[str, Any] = {"peak": None}
 
         # Whether or not the wallet is synced (required to make payments)
         self.wallet_synced = False
+
+        # The fee to pay ( In mojo ) when claiming a block reward
+        self.claim_fee: uint64 = uint64(pool_config.get("block_claim_fee", 0))
 
         # We target these many partials for this number of seconds. We adjust after receiving this many partials.
         self.number_of_partials_target: int = pool_config["number_of_partials_target"]
@@ -190,7 +199,7 @@ class Pool:
             self.config["self_hostname"], uint16(self.wallet_rpc_port), DEFAULT_ROOT_PATH, self.config
         )
         self.blockchain_state = await self.node_rpc_client.get_blockchain_state()
-        res = await self.wallet_rpc_client.log_in_and_skip(fingerprint=self.wallet_fingerprint)
+        res = await self.wallet_rpc_client.log_in(fingerprint=self.wallet_fingerprint)
         if not res["success"]:
             raise ValueError(f"Error logging in: {res['error']}. Make sure your config fingerprint is correct.")
         self.log.info(f"Logging in: {res}")
@@ -241,12 +250,13 @@ class Pool:
                 self.log.error(f"Unexpected error in get_peak_loop: {e}")
                 await asyncio.sleep(30)
 
-    async def collect_pool_rewards_loop(self):
+    async def collect_pool_rewards_loop(self) -> None:
         """
         Iterates through the blockchain, looking for pool rewards, and claims them, creating a transaction to the
         pool's puzzle_hash.
         """
 
+        assert self.node_rpc_client
         while True:
             try:
                 if not self.blockchain_state["sync"]["synced"]:
@@ -298,9 +308,9 @@ class Pool:
                         not_claimable_amounts += ph_to_amounts[rec.p2_singleton_puzzle_hash]
 
                 if len(coin_records) > 0:
-                    self.log.info(f"Claimable amount: {claimable_amounts / (10**12)}")
-                    self.log.info(f"Not claimable amount: {not_claimable_amounts / (10**12)}")
-                    self.log.info(f"Not buried amounts: {not_buried_amounts / (10**12)}")
+                    self.log.info(f"Claimable amount: {claimable_amounts / (10 ** 12)}")
+                    self.log.info(f"Not claimable amount: {not_claimable_amounts / (10 ** 12)}")
+                    self.log.info(f"Not buried amounts: {not_buried_amounts / (10 ** 12)}")
 
                 for rec in farmer_records:
                     if rec.is_pool_member:
@@ -310,9 +320,9 @@ class Pool:
                         if singleton_tip is None:
                             continue
 
-                        singleton_coin_record: Optional[
-                            CoinRecord
-                        ] = await self.node_rpc_client.get_coin_record_by_name(singleton_tip.name())
+                        singleton_coin_record: Optional[CoinRecord] = (
+                            await self.node_rpc_client.get_coin_record_by_name(singleton_tip.name())
+                        )
                         if singleton_coin_record is None:
                             continue
                         if singleton_coin_record.spent:
@@ -328,6 +338,9 @@ class Pool:
                             self.blockchain_state["peak"].height,
                             ph_to_coins[rec.p2_singleton_puzzle_hash],
                             self.constants.GENESIS_CHALLENGE,
+                            self.claim_fee,
+                            self.wallet_rpc_client,
+                            self.default_target_puzzle_hash,
                         )
 
                         if spend_bundle is None:
@@ -348,7 +361,7 @@ class Pool:
                 self.log.error(f"Unexpected error in collect_pool_rewards_loop: {e} {error_stack}")
                 await asyncio.sleep(self.collect_pool_rewards_interval)
 
-    async def create_payment_loop(self):
+    async def create_payment_loop(self) -> None:
         """
         Calculates the points of each farmer, and splits the total funds received into coins for each farmer.
         Saves the transactions that we should make, to `amount_to_distribute`.
@@ -360,6 +373,7 @@ class Pool:
                     await asyncio.sleep(60)
                     continue
 
+                assert self.pending_payments
                 if self.pending_payments.qsize() != 0:
                     self.log.warning(f"Pending payments ({self.pending_payments.qsize()}), waiting")
                     await asyncio.sleep(60)
@@ -367,6 +381,7 @@ class Pool:
 
                 self.log.info("Starting to create payment")
 
+                assert self.node_rpc_client
                 coin_records: List[CoinRecord] = await self.node_rpc_client.get_coin_records_by_puzzle_hash(
                     self.default_target_puzzle_hash,
                     include_spent_coins=False,
@@ -388,15 +403,15 @@ class Pool:
                     continue
 
                 self.log.info(f"Total amount claimed: {total_amount_claimed / (10 ** 12)}")
-                self.log.info(f"Pool coin amount (includes blockchain fee) {pool_coin_amount  / (10 ** 12)}")
-                self.log.info(f"Total amount to distribute: {amount_to_distribute  / (10 ** 12)}")
+                self.log.info(f"Pool coin amount (includes blockchain fee) {pool_coin_amount / (10 ** 12)}")
+                self.log.info(f"Total amount to distribute: {amount_to_distribute / (10 ** 12)}")
 
                 async with self.store.lock:
                     # Get the points of each farmer, as well as payout instructions. Here a chia address is used,
                     # but other blockchain addresses can also be used.
-                    points_and_ph: List[
-                        Tuple[uint64, bytes]
-                    ] = await self.store.get_farmer_points_and_payout_instructions()
+                    points_and_ph: List[Tuple[uint64, bytes]] = (
+                        await self.store.get_farmer_points_and_payout_instructions()
+                    )
                     total_points = sum([pt for (pt, ph) in points_and_ph])
                     if total_points > 0:
                         mojo_per_point = floor(amount_to_distribute / total_points)
@@ -432,16 +447,18 @@ class Pool:
                 self.log.error(f"Unexpected error in create_payments_loop: {e} {error_stack}")
                 await asyncio.sleep(self.payment_interval)
 
-    async def submit_payment_loop(self):
+    async def submit_payment_loop(self) -> None:
         while True:
             try:
                 peak_height = self.blockchain_state["peak"].height
-                await self.wallet_rpc_client.log_in_and_skip(fingerprint=self.wallet_fingerprint)
+                assert self.wallet_rpc_client
+                await self.wallet_rpc_client.log_in(fingerprint=self.wallet_fingerprint)
                 if not self.blockchain_state["sync"]["synced"] or not self.wallet_synced:
                     self.log.warning("Waiting for wallet sync")
                     await asyncio.sleep(60)
                     continue
 
+                assert self.pending_payments
                 payment_targets = await self.pending_payments.get()
                 assert len(payment_targets) > 0
 
@@ -452,12 +469,22 @@ class Pool:
                 # blockchain_fee = 0.00001 * (10 ** 12) * len(payment_targets)
                 blockchain_fee: uint64 = uint64(0)
                 try:
-                    transaction: TransactionRecord = await self.wallet_rpc_client.send_transaction_multi(
-                        self.wallet_id, payment_targets, fee=blockchain_fee
+                    tx_config = TXConfig(
+                        max_coin_amount=uint64(DEFAULT_CONSTANTS.MAX_COIN_AMOUNT),
+                        min_coin_amount=uint64(0),
+                        excluded_coin_amounts=[uint64(0)],
+                        excluded_coin_ids=[],
+                        reuse_puzhash=False,
                     )
+                    assert self.wallet_rpc_client
+                    response: SendTransactionMultiResponse = await self.wallet_rpc_client.send_transaction_multi(
+                        self.wallet_id, payment_targets, tx_config, fee=blockchain_fee
+                    )
+                    transaction: TransactionRecord = response.transaction
                 except ValueError as e:
                     self.log.error(f"Error making payment: {e}")
                     await asyncio.sleep(10)
+                    assert self.pending_payments
                     await self.pending_payments.put(payment_targets)
                     continue
 
@@ -467,7 +494,8 @@ class Pool:
                     not transaction.confirmed
                     or not (peak_height - transaction.confirmed_at_height) > self.confirmation_security_threshold
                 ):
-                    transaction = await self.wallet_rpc_client.get_transaction(self.wallet_id, transaction.name)
+                    assert self.wallet_rpc_client
+                    transaction = await self.wallet_rpc_client.get_transaction(transaction.name)
                     peak_height = self.blockchain_state["peak"].height
                     self.log.info(
                         f"Waiting for transaction to obtain {self.confirmation_security_threshold} confirmations"
@@ -489,7 +517,7 @@ class Pool:
                 self.log.error(f"Unexpected error in submit_payment_loop: {e}")
                 await asyncio.sleep(60)
 
-    async def confirm_partials_loop(self):
+    async def confirm_partials_loop(self) -> None:
         """
         Pulls things from the queue of partials one at a time, and adjusts balances.
         """
@@ -498,6 +526,7 @@ class Pool:
             try:
                 # The points are based on the difficulty at the time of partial submission, not at the time of
                 # confirmation
+                assert self.pending_point_partials
                 partial, time_received, points_received = await self.pending_point_partials.get()
 
                 # Wait a few minutes to check if partial is still valid in the blockchain (no reorgs)
@@ -512,6 +541,9 @@ class Pool:
                 self.log.error(f"Unexpected error: {e}")
 
     async def check_and_confirm_partial(self, partial: PostPartialRequest, points_received: uint64) -> None:
+        if self.node_rpc_client is None:
+            self.log.error("Logic Error: check_and_confirm_partial called with self.node_rpc_client=None")
+            return
         try:
             # TODO(pool): these lookups to the full node are not efficient and can be cached, especially for
             #  scaling to many users
@@ -535,9 +567,9 @@ class Pool:
             self.recent_points_added.put(pos_hash, uint64(1))
 
             # Now we need to check to see that the singleton in the blockchain is still assigned to this pool
-            singleton_state_tuple: Optional[
-                Tuple[CoinSpend, PoolState, bool]
-            ] = await self.get_and_validate_singleton_state(partial.payload.launcher_id)
+            singleton_state_tuple: Optional[Tuple[CoinSpend, PoolState, bool]] = (
+                await self.get_and_validate_singleton_state(partial.payload.launcher_id)
+            )
 
             if singleton_state_tuple is None:
                 self.log.info(f"Invalid singleton {partial.payload.launcher_id}")
@@ -545,11 +577,13 @@ class Pool:
 
             _, _, is_member = singleton_state_tuple
             if not is_member:
-                self.log.info(f"Singleton is not assigned to this pool")
+                self.log.info(f"Singleton {partial.payload.launcher_id} is not assigned to this pool")
                 return
 
             async with self.store.lock:
                 farmer_record: Optional[FarmerRecord] = await self.store.get_farmer_record(partial.payload.launcher_id)
+                if farmer_record is None:
+                    raise RuntimeError(f"get_farmer_record failed for {partial.payload.launcher_id}")
 
                 assert (
                     partial.payload.proof_of_space.pool_contract_puzzle_hash == farmer_record.p2_singleton_puzzle_hash
@@ -565,6 +599,25 @@ class Pool:
             error_stack = traceback.format_exc()
             self.log.error(f"Exception in confirming partial: {e} {error_stack}")
 
+    async def validate_payout_instructions(self, payout_instructions: str) -> Optional[str]:
+        """
+        Returns the puzzle hash as a hex string from the payout instructions (puzzle hash hex or bech32m address)
+        if it's encoded correctly, otherwise returns None.
+        """
+        try:
+            if len(decode_puzzle_hash(payout_instructions)) == 32:
+                return decode_puzzle_hash(payout_instructions).hex()
+        except ValueError:
+            # Not a Chia address
+            pass
+        try:
+            if len(hexstr_to_bytes(payout_instructions)) == 32:
+                return payout_instructions
+        except ValueError:
+            # Not a puzzle hash
+            pass
+        return None
+
     async def add_farmer(self, request: PostFarmerRequest, metadata: RequestMetadata) -> Dict:
         async with self.store.lock:
             farmer_record: Optional[FarmerRecord] = await self.store.get_farmer_record(request.payload.launcher_id)
@@ -574,16 +627,19 @@ class Pool:
                     f"Farmer with launcher_id {request.payload.launcher_id} already known.",
                 )
 
-            singleton_state_tuple: Optional[
-                Tuple[CoinSpend, PoolState, bool]
-            ] = await self.get_and_validate_singleton_state(request.payload.launcher_id)
+            singleton_state_tuple: Optional[Tuple[CoinSpend, PoolState, bool]] = (
+                await self.get_and_validate_singleton_state(request.payload.launcher_id)
+            )
 
             if singleton_state_tuple is None:
                 return error_dict(PoolErrorCode.INVALID_SINGLETON, f"Invalid singleton {request.payload.launcher_id}")
 
             last_spend, last_state, is_member = singleton_state_tuple
             if is_member is None:
-                return error_dict(PoolErrorCode.INVALID_SINGLETON, f"Singleton is not assigned to this pool")
+                return error_dict(
+                    PoolErrorCode.INVALID_SINGLETON,
+                    f"Singleton {request.payload.launcher_id} is not assigned to this pool",
+                )
 
             if (
                 request.payload.suggested_difficulty is None
@@ -593,25 +649,29 @@ class Pool:
             else:
                 difficulty = request.payload.suggested_difficulty
 
-            if len(hexstr_to_bytes(request.payload.payout_instructions)) != 32:
+            puzzle_hash: Optional[str] = await self.validate_payout_instructions(request.payload.payout_instructions)
+            if puzzle_hash is None:
                 return error_dict(
                     PoolErrorCode.INVALID_PAYOUT_INSTRUCTIONS,
-                    f"Payout instructions must be an xch address for this pool.",
+                    f"Payout instructions must be an xch address or puzzle hash for this pool. We got: "
+                    f"[{request.payload.payout_instructions}]",
                 )
 
             if not AugSchemeMPL.verify(last_state.owner_pubkey, request.payload.get_hash(), request.signature):
-                return error_dict(PoolErrorCode.INVALID_SIGNATURE, f"Invalid signature")
+                return error_dict(PoolErrorCode.INVALID_SIGNATURE, f"Invalid signature: {request.signature}")
 
+            assert self.node_rpc_client
             launcher_coin: Optional[CoinRecord] = await self.node_rpc_client.get_coin_record_by_name(
                 request.payload.launcher_id
             )
             assert launcher_coin is not None and launcher_coin.spent
-
+            assert self.node_rpc_client
             launcher_solution: Optional[CoinSpend] = await get_coin_spend(self.node_rpc_client, launcher_coin)
+            assert launcher_solution
             delay_time, delay_puzzle_hash = get_delayed_puz_info_from_launcher_spend(launcher_solution)
 
             if delay_time < 3600:
-                return error_dict(PoolErrorCode.DELAY_TIME_TOO_SHORT, f"Delay time too short, must be at least 1 hour")
+                return error_dict(PoolErrorCode.DELAY_TIME_TOO_SHORT, "Delay time too short, must be at least 1 hour")
 
             p2_singleton_puzzle_hash = launcher_id_to_p2_puzzle_hash(
                 request.payload.launcher_id, delay_time, delay_puzzle_hash
@@ -627,7 +687,7 @@ class Pool:
                 last_state,
                 uint64(0),
                 difficulty,
-                request.payload.payout_instructions,
+                puzzle_hash,
                 True,
             )
             self.scan_p2_singleton_puzzle_hashes.add(p2_singleton_puzzle_hash)
@@ -640,61 +700,69 @@ class Pool:
         # First check if this launcher_id is currently blocked for farmer updates, if so there is no reason to validate
         # all the stuff below
         if launcher_id in self.farmer_update_blocked:
-            return error_dict(PoolErrorCode.REQUEST_FAILED, f"Cannot update farmer yet.")
+            return error_dict(PoolErrorCode.REQUEST_FAILED, "Cannot update farmer yet.")
         farmer_record: Optional[FarmerRecord] = await self.store.get_farmer_record(launcher_id)
         if farmer_record is None:
             return error_dict(PoolErrorCode.FARMER_NOT_KNOWN, f"Farmer with launcher_id {launcher_id} not known.")
 
-        singleton_state_tuple: Optional[
-            Tuple[CoinSpend, PoolState, bool]
-        ] = await self.get_and_validate_singleton_state(launcher_id)
+        singleton_state_tuple: Optional[Tuple[CoinSpend, PoolState, bool]] = (
+            await self.get_and_validate_singleton_state(launcher_id)
+        )
 
         if singleton_state_tuple is None:
             return error_dict(PoolErrorCode.INVALID_SINGLETON, f"Invalid singleton {request.payload.launcher_id}")
 
         last_spend, last_state, is_member = singleton_state_tuple
         if is_member is None:
-            return error_dict(PoolErrorCode.INVALID_SINGLETON, f"Singleton is not assigned to this pool")
+            return error_dict(
+                PoolErrorCode.INVALID_SINGLETON, f"Singleton {request.payload.launcher_id} is not assigned to this pool"
+            )
 
         if not AugSchemeMPL.verify(last_state.owner_pubkey, request.payload.get_hash(), request.signature):
-            return error_dict(PoolErrorCode.INVALID_SIGNATURE, f"Invalid signature")
+            return error_dict(PoolErrorCode.INVALID_SIGNATURE, f"Invalid signature {request.signature}")
 
-        farmer_dict = farmer_record.to_json_dict()
-        response_dict = {}
+        updated_record: FarmerRecord = dataclasses.replace(farmer_record)
+        response_dict: Dict[str, bool] = {}
         if request.payload.authentication_public_key is not None:
             is_new_value = farmer_record.authentication_public_key != request.payload.authentication_public_key
             response_dict["authentication_public_key"] = is_new_value
             if is_new_value:
-                farmer_dict["authentication_public_key"] = request.payload.authentication_public_key
+                updated_record = dataclasses.replace(
+                    updated_record, authentication_public_key=request.payload.authentication_public_key
+                )
 
         if request.payload.payout_instructions is not None:
-            is_new_value = (
-                farmer_record.payout_instructions != request.payload.payout_instructions
-                and request.payload.payout_instructions is not None
-                and len(hexstr_to_bytes(request.payload.payout_instructions)) == 32
+            new_ph: Optional[str] = await self.validate_payout_instructions(request.payload.payout_instructions)
+            if new_ph is None:
+                return error_dict(PoolErrorCode.INVALID_PAYOUT_INSTRUCTIONS, "Failed to validate payout instructions.")
+
+            response_dict["payout_instructions"] = farmer_record.payout_instructions != new_ph
+            if response_dict["payout_instructions"]:
+                updated_record = dataclasses.replace(updated_record, payout_instructions=new_ph)
+
+        if updated_record != farmer_record:
+            self.log.info(f"Update farmer record to {updated_record}")
+            await self.store.add_farmer_record(updated_record, metadata)
+
+        async def update_difficulty_later():
+            await asyncio.sleep(self.farmer_update_cooldown_seconds)
+            await self.store.update_difficulty(launcher_id, request.payload.suggested_difficulty)
+            self.farmer_update_blocked.remove(launcher_id)
+            self.log.info(
+                f"Updated difficulty for {launcher_id}:"
+                f"{self.farmer_update_cooldown_seconds}s delayed to {request.payload.suggested_difficulty}"
             )
-            response_dict["payout_instructions"] = is_new_value
-            if is_new_value:
-                farmer_dict["payout_instructions"] = request.payload.payout_instructions
 
         if request.payload.suggested_difficulty is not None:
             is_new_value = (
-                farmer_record.difficulty != request.payload.suggested_difficulty
+                updated_record.difficulty != request.payload.suggested_difficulty
                 and request.payload.suggested_difficulty is not None
                 and request.payload.suggested_difficulty >= self.min_difficulty
             )
             response_dict["suggested_difficulty"] = is_new_value
             if is_new_value:
-                farmer_dict["difficulty"] = request.payload.suggested_difficulty
-
-        async def update_farmer_later():
-            await asyncio.sleep(self.farmer_update_cooldown_seconds)
-            await self.store.add_farmer_record(FarmerRecord.from_json_dict(farmer_dict), metadata)
-            self.farmer_update_blocked.remove(launcher_id)
-            self.log.info(f"Updated farmer: {response_dict}")
-
-        self.farmer_update_blocked.add(launcher_id)
-        asyncio.create_task(update_farmer_later())
+                self.farmer_update_blocked.add(launcher_id)
+                asyncio.create_task(update_difficulty_later())
 
         # TODO Fix chia-blockchain's Streamable implementation to support Optional in `from_json_dict`, then use
         # PutFarmerResponse here and in the trace up.
@@ -710,9 +778,10 @@ class Pool:
         """
         singleton_task: Optional[Task] = self.follow_singleton_tasks.get(launcher_id, None)
         remove_after = False
-        farmer_rec = None
+        farmer_rec: Optional[FarmerRecord] = None
+        assert self.node_rpc_client
         if singleton_task is None or singleton_task.done():
-            farmer_rec: Optional[FarmerRecord] = await self.store.get_farmer_record(launcher_id)
+            farmer_rec = await self.store.get_farmer_record(launcher_id)
             singleton_task = asyncio.create_task(
                 get_singleton_state(
                     self.node_rpc_client,
@@ -783,6 +852,7 @@ class Pool:
         partial: PostPartialRequest,
         farmer_record: FarmerRecord,
         time_received_partial: uint64,
+        peak_height: uint32,
     ) -> Dict:
         # Validate signatures
         message: bytes32 = partial.payload.get_hash()
@@ -833,12 +903,20 @@ class Pool:
 
         # Validate the proof
         if signage_point is not None:
+            assert signage_point.cc_vdf
             challenge_hash: bytes32 = signage_point.cc_vdf.challenge
         else:
+            assert end_of_sub_slot
+            assert end_of_sub_slot.challenge_chain
             challenge_hash = end_of_sub_slot.challenge_chain.get_hash()
 
-        quality_string: Optional[bytes32] = partial.payload.proof_of_space.verify_and_get_quality_string(
-            self.constants, challenge_hash, partial.payload.sp_hash
+        # Note the use of peak_height + 1. We Are evaluating the suitability for the next block
+        quality_string: Optional[bytes32] = verify_and_get_quality_string(
+            partial.payload.proof_of_space,
+            self.constants,
+            challenge_hash,
+            partial.payload.sp_hash,
+            height=uint32(peak_height + 1),
         )
         if quality_string is None:
             return error_dict(PoolErrorCode.INVALID_PROOF, f"Invalid proof of space {partial.payload.sp_hash}")
@@ -858,13 +936,14 @@ class Pool:
                 f"Proof of space has required iters {required_iters}, too high for difficulty " f"{current_difficulty}",
             )
 
+        assert self.pending_point_partials
         await self.pending_point_partials.put((partial, time_received_partial, current_difficulty))
 
         async with self.store.lock:
             # Obtains the new record in case we just updated difficulty
-            farmer_record: Optional[FarmerRecord] = await self.store.get_farmer_record(partial.payload.launcher_id)
-            if farmer_record is not None:
-                current_difficulty = farmer_record.difficulty
+            farmer_record_from_store = await self.store.get_farmer_record(partial.payload.launcher_id)
+            if farmer_record_from_store is not None:
+                current_difficulty = farmer_record_from_store.difficulty
                 # Decide whether to update the difficulty
                 recent_partials = await self.store.get_recent_partials(
                     partial.payload.launcher_id, self.number_of_partials_target
